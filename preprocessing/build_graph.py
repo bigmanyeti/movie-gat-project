@@ -1,12 +1,23 @@
 """
 Builds a heterogeneous graph from the enriched MovieLens metadata.
 
-Node types : movie, genre, actor, director, producer
+Node types : movie, genre, actor, director
+             (producer is intentionally NOT modeled -- see note below)
 Edge types : (movie, has_genre, genre)
              (movie, has_actor, actor)
              (movie, directed_by, director)
-             (movie, produced_by, producer)
-             (movie, similar_to, movie)
+             (movie, similar_to, movie)        -- shared-genre similarity
+             (movie, same_franchise, movie)    -- shared root TITLE
+                                                   (e.g. Toy Story / Toy
+                                                   Story 2 / Toy Story 3),
+                                                   weighted higher than
+                                                   plain genre similarity
+                                                   so title carries more
+                                                   influence in the GAT.
+
+Producer nodes/edges have been removed entirely from this graph (the
+"traditional" fixed-weight baseline in models/traditional/ has had its
+weights renormalized across genre/actor/director accordingly).
 
 The graph is represented both as a NetworkX graph (for visualization)
 and as a PyTorch Geometric HeteroData object (for GAT training). To
@@ -19,12 +30,14 @@ explanation.
 
 import os
 import pickle
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
 import networkx as nx
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import MultiLabelBinarizer, MinMaxScaler
+from sklearn.preprocessing import MultiLabelBinarizer
+
+from utils.title_utils import root_title
 
 PROCESSED_DIR = os.path.join(os.path.dirname(__file__), "..", "dataset", "processed")
 GRAPH_CACHE = os.path.join(PROCESSED_DIR, "graph_cache.pkl")
@@ -76,7 +89,7 @@ class MovieGraphBuilder:
                 num_ratings=float(row["num_ratings"]),
             )
 
-        # Genre, actor, director, producer nodes + edges
+        # Genre, actor, director nodes + edges
         for _, row in self.movies_df.iterrows():
             mkey = f"movie::{row['movieId']}"
 
@@ -97,13 +110,13 @@ class MovieGraphBuilder:
             self.G.add_edge(mkey, dkey, etype="directed_by", weight=1.0)
             self.G.add_edge(dkey, mkey, etype="rev_directed_by", weight=1.0)
 
-            pkey = f"producer::{row['producer']}"
-            self._add_node(pkey, "producer", name=row["producer"])
-            self.G.add_edge(mkey, pkey, etype="produced_by", weight=1.0)
-            self.G.add_edge(pkey, mkey, etype="rev_produced_by", weight=1.0)
-
-        # Movie -> Movie similarity edges (based on shared genre/actor/director overlap)
+        # Movie -> Movie similarity edges (based on shared genre overlap)
         self._add_similarity_edges(top_k=similarity_top_k)
+
+        # Movie -> Movie franchise edges (based on shared root TITLE) --
+        # gives title a direct, strong structural role in the graph, on
+        # top of (and weighted higher than) plain genre-overlap similarity.
+        self._add_title_franchise_edges()
 
         return self.G
 
@@ -160,52 +173,86 @@ class MovieGraphBuilder:
                 if added >= top_k:
                     break
 
+    def _add_title_franchise_edges(self):
+        """
+        Connects movies that share the same "root title" (i.e. the same
+        franchise once sequel numbering/roman numerals are stripped --
+        see utils/title_utils.root_title), for example:
+
+            "Toy Story", "Toy Story 2", "Toy Story 3"  -> all linked
+
+        These edges get a much higher weight (FRANCHISE_EDGE_WEIGHT) than
+        the plain genre-overlap `similar_to` edges, and are additionally
+        leveraged directly at recommendation time in gat_recommender.py.
+        """
+        FRANCHISE_EDGE_WEIGHT = 5.0
+
+        groups = defaultdict(list)
+        for _, row in self.movies_df.iterrows():
+            rt = root_title(row["title"])
+            if rt and len(rt) > 2:
+                groups[rt].append(row["movieId"])
+
+        for rt, movie_ids in groups.items():
+            if len(movie_ids) < 2:
+                continue
+            for i, mid_a in enumerate(movie_ids):
+                for mid_b in movie_ids[i + 1:]:
+                    akey, bkey = f"movie::{mid_a}", f"movie::{mid_b}"
+                    self.G.add_edge(akey, bkey, etype="same_franchise", weight=FRANCHISE_EDGE_WEIGHT)
+                    self.G.add_edge(bkey, akey, etype="same_franchise", weight=FRANCHISE_EDGE_WEIGHT)
+
     def node_features(self):
         """
         Builds a numeric feature matrix for every node, using simple
-        one-hot / scaled encodings appropriate for a graph-theory
+        one-hot / hashed encodings appropriate for a graph-theory
         focused mini project (feature richness is intentionally kept
         interpretable rather than maximized).
+
+        12-dimensional feature vector:
+            [0:4)  -- node-type one-hot (movie, genre, actor, director)
+            [4:12) -- 8-dim hashed identity embedding
+
+        Note on what was intentionally removed from the original 16-dim
+        vector: normalized release year, normalized avg rating, and
+        log-scaled popularity (num_ratings) are no longer encoded as
+        node features -- ranking/recommendation should be driven by
+        graph structure (genre/actor/director/title) rather than by a
+        movie's release date or how popular/well-rated it already is.
+        The `producer` node type/one-hot slot has also been removed
+        entirely (see class docstring).
+
+        Title weighting: for MOVIE nodes, the 8-dim hashed identity
+        embedding is derived from the movie's franchise ROOT TITLE
+        (see utils/title_utils.root_title) rather than its raw title.
+        This means "Toy Story", "Toy Story 2", and "Toy Story 3" all
+        hash to the exact same identity block, giving title a strong,
+        direct influence on the resulting GAT embeddings on top of the
+        explicit `same_franchise` graph edges added above. Non-movie
+        nodes (genre/actor/director) keep a plain name-based hash.
         """
         n = len(self.node_index)
-        feat_dim = 16
+        feat_dim = 12
         X = np.zeros((n, feat_dim), dtype=np.float32)
 
-        type_onehot = {"movie": 0, "genre": 1, "actor": 2, "director": 3, "producer": 4}
+        type_onehot = {"movie": 0, "genre": 1, "actor": 2, "director": 3}
 
-        years = []
-        ratings = []
         for key, idx in self.node_index.items():
             data = self.G.nodes[key]
             ntype = data["ntype"]
             X[idx, type_onehot[ntype]] = 1.0
+
+            # Hashed identity embedding (8-dim hash bucket), used to break
+            # symmetry between different actors/directors/genres, and --
+            # for movies -- to encode franchise identity via the root title.
             if ntype == "movie":
-                years.append(data.get("year", 2000))
-                ratings.append(data.get("avg_rating", 3.0))
-
-        year_scaler = MinMaxScaler()
-        rating_scaler = MinMaxScaler()
-        if years:
-            year_scaler.fit(np.array(years).reshape(-1, 1))
-            rating_scaler.fit(np.array(ratings).reshape(-1, 1))
-
-        for key, idx in self.node_index.items():
-            data = self.G.nodes[key]
-            if data["ntype"] == "movie":
-                y = year_scaler.transform([[data.get("year", 2000)]])[0, 0]
-                r = rating_scaler.transform([[data.get("avg_rating", 3.0)]])[0, 0]
-                pop = np.log1p(data.get("num_ratings", 0.0))
-                X[idx, 5] = y
-                X[idx, 6] = r
-                X[idx, 7] = min(pop / 10.0, 1.0)
-
-            # Simple hashed embedding for names to break symmetry between
-            # different actors/directors/producers/genres (8-dim hash bucket).
-            name = data.get("name") or data.get("title") or key
+                name = root_title(data.get("title", "")) or data.get("title") or key
+            else:
+                name = data.get("name") or key
             h = abs(hash(name))
             for k in range(8):
                 bit = (h >> k) & 1
-                X[idx, 8 + k] = float(bit)
+                X[idx, 4 + k] = float(bit)
 
         return X
 

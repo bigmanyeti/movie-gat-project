@@ -7,23 +7,25 @@ Similarity is computed as a weighted sum of:
     - Genre overlap (Jaccard)
     - Actor overlap (Jaccard)
     - Director match (binary)
-    - Producer match (binary)
 
-with fixed weights:
-    genre    = 0.4
-    actor    = 0.3
-    director = 0.2
-    producer = 0.1
+Producer has been removed entirely (see preprocessing/build_graph.py
+for the matching removal on the GAT side). The original manual weights
+(genre 0.4 / actor 0.3 / director 0.2 / producer 0.1) have been
+renormalized across the three remaining criteria so they still sum
+to 1.0:
+
+    genre    = 0.4 / 0.9 ~= 0.444
+    actor    = 0.3 / 0.9 ~= 0.333
+    director = 0.2 / 0.9 ~= 0.222
 """
 
 import pandas as pd
 
 
 DEFAULT_WEIGHTS = {
-    "genre": 0.4,
-    "actor": 0.3,
-    "director": 0.2,
-    "producer": 0.1,
+    "genre": 0.4 / 0.9,
+    "actor": 0.3 / 0.9,
+    "director": 0.2 / 0.9,
 }
 
 
@@ -51,19 +53,16 @@ class TraditionalRecommender:
         genre_sim = self._jaccard(row_a["genres_set"], row_b["genres_set"])
         actor_sim = self._jaccard(row_a["actors_set"], row_b["actors_set"])
         director_sim = 1.0 if row_a["director"] == row_b["director"] else 0.0
-        producer_sim = 1.0 if row_a["producer"] == row_b["producer"] else 0.0
 
         score = (
             self.weights["genre"] * genre_sim
             + self.weights["actor"] * actor_sim
             + self.weights["director"] * director_sim
-            + self.weights["producer"] * producer_sim
         )
         breakdown = {
             "genre": self.weights["genre"] * genre_sim,
             "actor": self.weights["actor"] * actor_sim,
             "director": self.weights["director"] * director_sim,
-            "producer": self.weights["producer"] * producer_sim,
         }
         return score, breakdown
 

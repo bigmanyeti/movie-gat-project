@@ -1,6 +1,6 @@
 """
 Downloads and prepares the REAL TMDB 5000 Movie Dataset — no synthetic
-or randomly assigned metadata. Director, cast (actors), producer, and
+or randomly assigned metadata. Director, cast (actors), and
 vote_average (real audience rating) are all genuine data pulled from
 The Movie Database (TMDB), sourced via the well-known "tmdb_5000"
 movies+credits CSV pair (originally distributed on Kaggle; mirrored
@@ -10,8 +10,9 @@ Dataset contents (real, not synthesized):
     - 4,803 movies
     - Real genres, real release year
     - Real vote_average / vote_count (TMDB's aggregated user rating)
-    - Real cast (top-billed actors) and real crew (Director, Producer)
-      pulled from TMDB's structured JSON crew field
+    - Real cast (top-billed actors) and real crew (Director) pulled
+      from TMDB's structured JSON crew field
+      (producer is intentionally not extracted -- removed project-wide)
 
 Run this once before running the Streamlit app:
     python dataset/download_data.py
@@ -73,16 +74,6 @@ def _extract_director(crew_raw):
     return directors[0] if directors else "Unknown Director"
 
 
-def _extract_producer(crew_raw):
-    parsed = _safe_literal_eval(crew_raw)
-    # TMDB has several producer job titles; prefer "Producer" over
-    # "Executive Producer" / "Co-Producer" when both exist.
-    producers = [c["name"] for c in parsed if c.get("job") == "Producer"]
-    if not producers:
-        producers = [c["name"] for c in parsed if "Producer" in c.get("job", "")]
-    return producers[0] if producers else "Unknown Producer"
-
-
 def _extract_year(release_date):
     if isinstance(release_date, str) and len(release_date) >= 4:
         try:
@@ -113,7 +104,6 @@ def build_dataset(force_rebuild=False):
     merged["genres"] = merged["genres"].apply(_extract_genres)
     merged["actors"] = merged["cast"].apply(_extract_cast)
     merged["director"] = merged["crew"].apply(_extract_director)
-    merged["producer"] = merged["crew"].apply(_extract_producer)
     merged["year"] = merged["release_date"].apply(_extract_year)
     merged["year"] = merged["year"].fillna(merged["year"].median()).astype(int)
 
@@ -122,16 +112,18 @@ def build_dataset(force_rebuild=False):
     merged = merged[(merged["genres"] != "") & (merged["actors"] != "")]
 
     # Rename to match the rest of the pipeline's expected schema
-    # (movieId, title, genres, director, actors, producer, year,
-    # avg_rating, num_ratings) — avg_rating/num_ratings now come
-    # directly from TMDB's own real aggregated user ratings, not
-    # MovieLens ratings.
+    # (movieId, title, genres, director, actors, year, avg_rating,
+    # num_ratings) — avg_rating/num_ratings now come directly from
+    # TMDB's own real aggregated user ratings, not MovieLens ratings.
+    # NOTE: producer is intentionally NOT extracted/kept -- it has been
+    # removed entirely from this project (graph nodes/edges, the GAT
+    # feature vector, and the traditional baseline's weights).
     out = merged.rename(columns={
         "id": "movieId",
         "vote_average": "avg_rating",
         "vote_count": "num_ratings",
     })[[
-        "movieId", "title", "genres", "director", "actors", "producer",
+        "movieId", "title", "genres", "director", "actors",
         "year", "avg_rating", "num_ratings",
     ]]
 

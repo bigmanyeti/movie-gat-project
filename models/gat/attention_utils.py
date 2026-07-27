@@ -1,9 +1,9 @@
 """
 Aggregates raw per-edge GAT attention coefficients into a per-neighbor
--type contribution breakdown (Genre / Actor / Director / Producer /
-Similar Movie) for a given movie node. This is the core "explainable"
-artifact of the project: instead of manually fixed weights, we show
-what the model actually learned to pay attention to.
+-type contribution breakdown (Genre / Actor / Director / Similar Movie
+/ Same-Franchise Movie) for a given movie node. This is the core
+"explainable" artifact of the project: instead of manually fixed
+weights, we show what the model actually learned to pay attention to.
 """
 
 import numpy as np
@@ -68,9 +68,9 @@ def compare_with_manual_weights(learned, manual=None):
     Side-by-side comparison table data between traditional manually
     assigned weights and the GAT-learned attention distribution.
     """
-    manual = manual or {"genre": 0.4, "actor": 0.3, "director": 0.2, "producer": 0.1}
+    manual = manual or {"genre": 0.4 / 0.9, "actor": 0.3 / 0.9, "director": 0.2 / 0.9}
     rows = []
-    for ntype in ["genre", "actor", "director", "producer"]:
+    for ntype in ["genre", "actor", "director"]:
         rows.append({
             "type": ntype,
             "manual_weight": manual.get(ntype, 0.0),

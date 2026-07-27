@@ -1,23 +1,40 @@
 """
-Loads Qwen2.5-7B-Instruct locally (no external APIs) and uses it to
-turn the GAT's learned attention breakdown into a natural-language
-explanation of why a movie was recommended.
+Turns the GAT's learned attention breakdown into a natural-language
+explanation of why a movie was recommended. Three backends are
+supported, in increasing order of setup cost:
 
-The model is loaded lazily (only when the user clicks "Explain" in
-the UI) since it is a 7B model and can take a while / a lot of VRAM
-to load. A lightweight rule-based fallback explanation is provided
-so the rest of the app remains usable on machines without a GPU or
-without the model downloaded.
+    "rule_based" -- fast, no LLM at all, always available.
+    "ollama"     -- calls a locally running Ollama server
+                    (http://localhost:11434) using whatever model you
+                    already have pulled there (e.g. `ollama pull
+                    qwen2.5:7b` / `llama3.1` / etc.). This is the
+                    recommended local-LLM option: no HuggingFace
+                    download, no manual quantization config, and it
+                    reuses a model you likely already have running.
+    "qwen"       -- loads Qwen2.5-7B-Instruct locally via HuggingFace
+                    transformers (no external APIs). This is a 7B
+                    model needing real GPU VRAM, kept as a heavier
+                    alternative for machines set up for it.
+
+Both "ollama" and "qwen" are loaded/contacted lazily (only when the
+user actually asks for an explanation), and both fall back to the
+rule-based explanation on any error so the rest of the app stays
+usable regardless of what's locally available.
 """
 
 import os
 import json
 import threading
+import urllib.request
+import urllib.error
 
 MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 ADAPTER_DIR = os.path.join(os.path.dirname(__file__), "finetune", "qwen25-7b-gat-explainer-lora")
 STATUS_PATH = os.path.join(ADAPTER_DIR, "training_status.json")
 LOSS_LOG_PATH = os.path.join(ADAPTER_DIR, "loss_history.json")
+
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+DEFAULT_OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
 
 _model = None
 _tokenizer = None
@@ -86,6 +103,43 @@ def _load_model(use_finetuned=False):
     return _model, _tokenizer
 
 
+def ollama_available():
+    """True if a local Ollama server is reachable at OLLAMA_HOST."""
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_HOST}/api/tags", timeout=1.5) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def list_ollama_models():
+    """Returns the list of model names currently pulled in the local
+    Ollama install (e.g. ['qwen2.5:7b', 'llama3.1:8b']), or [] if the
+    server isn't reachable."""
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_HOST}/api/tags", timeout=1.5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return [m["name"] for m in data.get("models", [])]
+    except Exception:
+        return []
+
+
+def _call_ollama(messages, model=None, timeout=60):
+    model = model or DEFAULT_OLLAMA_MODEL
+    payload = json.dumps({
+        "model": model,
+        "messages": messages,
+        "stream": False,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{OLLAMA_HOST}/api/chat", data=payload,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data["message"]["content"].strip()
+
+
 def is_model_loaded():
     return _model is not None
 
@@ -109,7 +163,7 @@ Recommendation method: {method}
 
 The GAT model learned the following attention-based contribution
 scores when aggregating information from the movie's graph
-neighborhood (genre, actor, director, producer nodes):
+neighborhood (genre, actor, director, and same-franchise/title nodes):
 
 {contribution_text}
 
@@ -128,10 +182,10 @@ _FINETUNE_SYSTEM_PROMPT = (
     "You are an expert film critic and recommendation assistant. You are "
     "given attention-based graph metrics produced by a Graph Attention "
     "Network (GAT) movie recommender, showing how much each relationship "
-    "type (Genre, Actor, Director, Producer) contributed to a recommendation. "
-    "Write a short, natural, expert movie-critique-style explanation that "
-    "references these metrics without sounding like you are just reading "
-    "off numbers."
+    "type (Genre, Actor, Director, Same-Franchise/Title) contributed to a "
+    "recommendation. Write a short, natural, expert movie-critique-style "
+    "explanation that references these metrics without sounding like you "
+    "are just reading off numbers."
 )
 
 
@@ -154,10 +208,46 @@ def _build_finetuned_messages(source_title, recommended_title, breakdown):
 
 
 def explain_recommendation(source_title, recommended_title, breakdown, method="GAT",
-                            use_llm=True, use_finetuned=False):
-    if not use_llm:
+                            backend="rule_based", ollama_model=None,
+                            use_llm=None, use_finetuned=False):
+    """
+    backend: one of "rule_based", "ollama", "qwen".
+
+    For backward compatibility, the old `use_llm=True/False` flag is
+    still accepted: `use_llm=False` forces "rule_based"; `use_llm=True`
+    (with backend left at its default) maps to "qwen" so existing
+    callers keep working unchanged.
+    """
+    if use_llm is False:
+        backend = "rule_based"
+    elif use_llm is True and backend == "rule_based":
+        backend = "qwen"
+
+    if backend == "rule_based":
         return _rule_based_explanation(source_title, recommended_title, breakdown, method)
 
+    if backend == "ollama":
+        return _explain_via_ollama(source_title, recommended_title, breakdown, method, ollama_model)
+
+    if backend == "qwen":
+        return _explain_via_qwen(source_title, recommended_title, breakdown, method, use_finetuned)
+
+    # Unknown backend -> safest default.
+    return _rule_based_explanation(source_title, recommended_title, breakdown, method)
+
+
+def _explain_via_ollama(source_title, recommended_title, breakdown, method, ollama_model=None):
+    try:
+        prompt = _build_prompt(source_title, recommended_title, breakdown, method)
+        messages = [{"role": "user", "content": prompt}]
+        return _call_ollama(messages, model=ollama_model)
+    except Exception as e:  # pragma: no cover - fallback path
+        fallback = _rule_based_explanation(source_title, recommended_title, breakdown, method)
+        return (f"[Ollama unavailable at {OLLAMA_HOST} ({e}); is `ollama serve` running "
+                f"and is the model pulled? Showing rule-based explanation instead]\n\n{fallback}")
+
+
+def _explain_via_qwen(source_title, recommended_title, breakdown, method, use_finetuned=False):
     if use_finetuned and not finetuned_adapter_available():
         use_finetuned = False  # silently fall back rather than error if not trained yet
 
@@ -187,7 +277,7 @@ def explain_recommendation(source_title, recommended_title, breakdown, method="G
 
     except Exception as e:  # pragma: no cover - fallback path
         fallback = _rule_based_explanation(source_title, recommended_title, breakdown, method)
-        return f"[Local LLM unavailable ({e}); showing rule-based explanation]\n\n{fallback}"
+        return f"[Local Qwen LLM unavailable ({e}); showing rule-based explanation]\n\n{fallback}"
 
 
 def _rule_based_explanation(source_title, recommended_title, breakdown, method):

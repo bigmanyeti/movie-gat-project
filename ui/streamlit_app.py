@@ -24,11 +24,21 @@ from visualization import graph_viz
 from llm.explainer import (
     explain_recommendation, finetuned_adapter_available,
     load_finetune_status, load_finetune_loss_history,
+    ollama_available, list_ollama_models, DEFAULT_OLLAMA_MODEL,
 )
 from utils.helpers import inject_dark_theme, movie_title_lookup
 
 st.set_page_config(page_title="Explainable GAT Movie Recommender", layout="wide", page_icon="🎬")
 inject_dark_theme()
+
+
+def _llm_variant_label(backend, use_finetuned, ollama_model):
+    if backend == "ollama":
+        return f"Local Ollama ({ollama_model})" if ollama_model else "Local Ollama"
+    if backend == "qwen":
+        return "fine-tuned adapter" if use_finetuned else "base Qwen model"
+    return "rule-based"
+
 
 # ---------------------------------------------------------------------------
 # Session state
@@ -105,25 +115,40 @@ with st.sidebar:
     if not dataset_ready:
         st.caption("🔒 Locked until dataset is loaded.")
 
-    epochs = st.slider("Training epochs", 20, 300, 100, step=10, disabled=not graph_ready)
+    epochs = st.slider(
+        "Max training epochs (search budget)", 20, 300, 100, step=10, disabled=not graph_ready,
+        help="The model first SEARCHES up to this many epochs to find the epoch with the "
+             "lowest loss, then RETRAINS a fresh model from scratch for exactly that many "
+             "epochs -- that retrained model is the one actually saved and used.",
+    )
 
     if st.button("3. Train GAT", use_container_width=True, disabled=not graph_ready):
-        progress = st.progress(0.0)
-        status = st.empty()
+        search_progress = st.progress(0.0)
+        search_status = st.empty()
+        retrain_progress = st.progress(0.0)
+        retrain_status = st.empty()
+
+        def search_log_cb(epoch, loss):
+            search_progress.progress(min((epoch + 1) / epochs, 1.0))
+            search_status.text(f"[Search] Epoch {epoch + 1}/{epochs} — loss {loss:.4f}")
 
         def log_cb(epoch, loss):
-            progress.progress(min((epoch + 1) / epochs, 1.0))
-            status.text(f"Epoch {epoch + 1}/{epochs} — loss {loss:.4f}")
+            # best_epoch isn't known until the search phase finishes, so we
+            # just show progress against the max search budget as an upper bound.
+            retrain_progress.progress(min((epoch + 1) / epochs, 1.0))
+            retrain_status.text(f"[Retrain] Epoch {epoch + 1} — loss {loss:.4f}")
 
-        with st.spinner("Training Graph Attention Network..."):
+        with st.spinner("Searching for the best epoch, then retraining from scratch..."):
             model, embeddings, attn_info, loss_history, train_stats = train_gat(
-                st.session_state.pyg_data, epochs=epochs, log_callback=log_cb
+                st.session_state.pyg_data, epochs=epochs,
+                log_callback=log_cb, search_log_callback=search_log_cb,
             )
             st.session_state.embeddings = embeddings
             st.session_state.attn_data = load_attention()
             st.session_state.loss_history = loss_history
-            st.session_state.trained_epochs = epochs
+            st.session_state.trained_epochs = train_stats["best_epoch"]
             st.session_state.train_stats = train_stats
+        retrain_progress.progress(1.0)
         # New training run -> any cached GAT recommendations are stale.
         st.session_state.results_cache = {
             k: v for k, v in st.session_state.results_cache.items() if k[1] != "GAT"
@@ -132,7 +157,10 @@ with st.sidebar:
             f"GAT training complete in {train_stats['elapsed_seconds']:.1f}s "
             f"({train_stats['num_params']:,} parameters, "
             f"{train_stats['num_nodes']:,} nodes, {train_stats['num_edges']:,} edges). "
-            f"Loss {train_stats['loss_start']:.3f} → {train_stats['loss_end']:.3f}."
+            f"Searched {train_stats['search_epochs']} epochs, found lowest loss "
+            f"({train_stats['best_loss']:.3f}) at epoch {train_stats['best_epoch']}, "
+            f"and retrained a fresh model for exactly {train_stats['best_epoch']} epochs "
+            f"({train_stats['loss_start']:.3f} → {train_stats['loss_end']:.3f})."
         )
         st.rerun()
     if not graph_ready:
@@ -145,18 +173,42 @@ with st.sidebar:
     st.markdown("- Traditional method: ✅ ready (no training needed, only requires graph)"
                 if graph_ready else "- Traditional method: ❌ needs graph built first")
     if st.session_state.trained_epochs is not None:
-        st.markdown(f"- GAT method: ✅ trained ({st.session_state.trained_epochs} epochs)")
+        st.markdown(f"- GAT method: ✅ trained (best epoch: {st.session_state.trained_epochs})")
     else:
         st.markdown("- GAT method: ❌ not trained yet")
 
     st.divider()
-    use_llm = st.checkbox("Use local Qwen2.5-7B for explanations", value=False,
-                           help="Requires the model to be downloaded and a capable GPU. "
-                                "If unchecked, a fast rule-based explanation is used instead.")
+    st.subheader("Explanation LLM")
+    ollama_up = ollama_available()
+    backend_options = ["Rule-based (no LLM)"]
+    backend_options.append("Local Ollama" + (" ✅" if ollama_up else " (server not detected)"))
+    backend_options.append("Local Qwen2.5-7B (transformers)")
 
-    adapter_ready = finetuned_adapter_available()
+    backend_choice = st.radio("Explanation backend", backend_options, index=0)
+
+    llm_backend = "rule_based"
+    ollama_model = None
     use_finetuned = False
-    if use_llm:
+
+    if backend_choice.startswith("Local Ollama"):
+        llm_backend = "ollama"
+        if ollama_up:
+            models = list_ollama_models()
+            if models:
+                ollama_model = st.selectbox("Ollama model", models,
+                                             index=0 if DEFAULT_OLLAMA_MODEL not in models
+                                             else models.index(DEFAULT_OLLAMA_MODEL))
+            else:
+                st.caption(f"ℹ️ No models pulled yet -- run e.g. `ollama pull {DEFAULT_OLLAMA_MODEL}`.")
+                ollama_model = DEFAULT_OLLAMA_MODEL
+        else:
+            st.caption(f"ℹ️ Couldn't reach Ollama at `{os.environ.get('OLLAMA_HOST', 'http://localhost:11434')}`. "
+                       "Start it with `ollama serve` (it usually starts automatically once installed).")
+    elif backend_choice.startswith("Local Qwen2.5-7B"):
+        llm_backend = "qwen"
+        st.caption("Requires the model to be downloaded and a capable GPU (~16GB VRAM). "
+                   "Falls back to rule-based automatically on error.")
+        adapter_ready = finetuned_adapter_available()
         if adapter_ready:
             use_finetuned = st.checkbox(
                 "Use fine-tuned LoRA adapter (trained on GAT metrics)", value=True,
@@ -207,8 +259,10 @@ with tabs[0]:
         c4.metric("Avg Degree", f"{sum(dict(G.degree()).values()) / G.number_of_nodes():.1f}")
 
         st.markdown("""
-        **Node types:** Movie, Genre, Actor, Director, Producer
-        **Edge types:** `has_genre`, `has_actor`, `directed_by`, `produced_by`, `similar_to`
+        **Node types:** Movie, Genre, Actor, Director
+        **Edge types:** `has_genre`, `has_actor`, `directed_by`, `similar_to`,
+        `same_franchise` (movies sharing the same root title, e.g. Toy Story
+        1/2/3 -- weighted higher than plain `similar_to`)
         (plus reverse edges to keep the graph traversable in both directions).
 
         This is a **heterogeneous, weighted, directed graph** — the foundation for
@@ -321,9 +375,11 @@ with tabs[2]:
                     )
             else:
                 if method == "Traditional":
-                    st.markdown("Computed with **fixed manual weights**: Genre 0.4, Actor 0.3, Director 0.2, Producer 0.1")
+                    st.markdown("Computed with **fixed manual weights**: Genre 0.44, Actor 0.33, Director 0.22")
                 else:
-                    st.markdown("Computed with **GAT-learned embeddings** and cosine similarity.")
+                    st.markdown("Computed with **GAT-learned embeddings**, cosine similarity, "
+                                 "and a title-similarity boost (with a guarantee that same-"
+                                 "franchise sequels/prequels are included).")
                 st.dataframe(
                     [{"Title": r["title"], "Score": round(r["score"], 4)} for r in results],
                     use_container_width=True,
@@ -400,9 +456,10 @@ with tabs[3]:
                     with st.spinner("Generating explanation..."):
                         explanation = explain_recommendation(
                             source_label, chosen_title, breakdown,
-                            method=explain_method, use_llm=use_llm, use_finetuned=use_finetuned,
+                            method=explain_method, backend=llm_backend,
+                            ollama_model=ollama_model, use_finetuned=use_finetuned,
                         )
-                    variant_label = "fine-tuned adapter" if use_finetuned else ("base Qwen model" if use_llm else "rule-based")
+                    variant_label = _llm_variant_label(llm_backend, use_finetuned, ollama_model)
                     st.caption(f"Generated using: {variant_label}")
                     st.markdown(f"> {explanation}")
 
@@ -431,10 +488,11 @@ with tabs[3]:
                                 chosen["title"],
                                 breakdown,
                                 method="GAT",
-                                use_llm=use_llm,
+                                backend=llm_backend,
+                                ollama_model=ollama_model,
                                 use_finetuned=use_finetuned,
                             )
-                        variant_label = "fine-tuned adapter" if use_finetuned else ("base Qwen model" if use_llm else "rule-based")
+                        variant_label = _llm_variant_label(llm_backend, use_finetuned, ollama_model)
                         st.caption(f"Generated using: {variant_label}")
                         st.markdown(f"> {explanation}")
                 else:
@@ -457,10 +515,11 @@ with tabs[3]:
                                 chosen["title"],
                                 fake_breakdown,
                                 method="Traditional",
-                                use_llm=use_llm,
+                                backend=llm_backend,
+                                ollama_model=ollama_model,
                                 use_finetuned=use_finetuned,
                             )
-                        variant_label = "fine-tuned adapter" if use_finetuned else ("base Qwen model" if use_llm else "rule-based")
+                        variant_label = _llm_variant_label(llm_backend, use_finetuned, ollama_model)
                         st.caption(f"Generated using: {variant_label}")
                         st.markdown(f"> {explanation}")
 
@@ -470,21 +529,34 @@ with tabs[4]:
     if st.session_state.loss_history is None:
         st.info("Train the GAT to see diagnostics.")
     else:
-        st.caption(f"From the most recent training run ({st.session_state.trained_epochs} epochs).")
-
         stats = st.session_state.train_stats
         if stats:
+            st.caption(
+                f"Searched {stats['search_epochs']} epochs, found the lowest loss at "
+                f"**epoch {stats['best_epoch']}** ({stats['best_loss']:.3f}), then retrained a "
+                f"fresh model from scratch for exactly {stats['best_epoch']} epochs — that "
+                f"retrained model is what's currently loaded."
+            )
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Training time", f"{stats['elapsed_seconds']:.1f}s")
+            c1.metric("Total time (search + retrain)", f"{stats['elapsed_seconds']:.1f}s")
             c2.metric("Model parameters", f"{stats['num_params']:,}")
-            c3.metric("Loss (start)", f"{stats['loss_start']:.3f}")
-            c4.metric("Loss (end)", f"{stats['loss_end']:.3f}")
+            c3.metric("Best epoch", stats['best_epoch'])
+            c4.metric("Best (retrain final) loss", f"{stats['loss_end']:.3f}")
             improvement = (stats['loss_start'] - stats['loss_end']) / max(abs(stats['loss_start']), 1e-8) * 100
-            st.caption(f"Loss dropped {improvement:.1f}% over training — confirms the model "
+            st.caption(f"Loss dropped {improvement:.1f}% over the retrain run — confirms the model "
                        f"is actually learning, not just running instantly with no effect. "
                        f"Small graph size ({stats['num_nodes']:,} nodes, {stats['num_edges']:,} edges) "
                        f"and a lightweight 2-layer GAT ({stats['num_params']:,} parameters) is why "
                        f"this completes in seconds rather than minutes.")
+
+            st.markdown("**Search phase** — loss across the full search budget (min marked):")
+            fig_search = graph_viz.training_loss_plot(stats["search_loss_history"])
+            ax = fig_search.axes[0]
+            ax.axvline(stats["best_epoch"] - 1, color="#57D9A3", linestyle="--", linewidth=1.5)
+            ax.scatter([stats["best_epoch"] - 1], [stats["best_loss"]], color="#57D9A3", zorder=5)
+            st.pyplot(fig_search, use_container_width=True)
+
+            st.markdown(f"**Retrain phase** — fresh model, trained for exactly {stats['best_epoch']} epochs:")
         fig = graph_viz.training_loss_plot(st.session_state.loss_history)
         st.pyplot(fig, use_container_width=True)
 

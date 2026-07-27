@@ -4,7 +4,7 @@ Visualization utilities for the movie knowledge graph.
 Provides:
     - draw_full_graph        : whole graph, uniform edge width (pre-training view)
     - draw_movie_neighborhood: ego-graph around one movie, edge width = attention
-    - attention_bar_chart    : bar chart of Genre/Actor/Director/Producer contribution
+    - attention_bar_chart    : bar chart of Genre/Actor/Director contribution
     - training_loss_plot     : line chart of GAT training loss
     - attention_histogram    : histogram of all learned attention coefficients
 """
@@ -20,7 +20,6 @@ TYPE_COLORS = {
     "genre": "#57D9A3",
     "actor": "#FFAB00",
     "director": "#FF5630",
-    "producer": "#C084FC",
 }
 
 
