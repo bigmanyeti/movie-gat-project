@@ -1,0 +1,27 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+# Core AI and CUDA requirements
+torch>=2.1.0
+torchvision
+torchaudio
+
+# LLM and Finetuning Additions
+transformers>=4.40.0
+accelerate>=0.27.0
+bitsandbytes>=0.43.0
+peft>=0.11.0
+trl>=0.9.0
+datasets>=2.19.0
+sentencepiece>=0.2.0
+
+# Graph Theory and Data Processing
+torch-geometric>=2.4.0
+networkx>=3.2
+pandas>=2.1.0
+numpy>=1.26.0
+scikit-learn>=1.4.0
+scipy>=1.11.0
+
+# UI and Visualization
+streamlit>=1.32.0
+matplotlib>=3.8.0
+plotly>=5.20.0
